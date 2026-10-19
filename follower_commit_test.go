@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: MPL-2.0
+
+package raft
+
+import (
+	"io"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+// recordingFSM records the index, term and data of every log it applies.
+type recordingFSM struct {
+	mu      sync.Mutex
+	applied []Log
+}
+
+func (f *recordingFSM) Apply(l *Log) interface{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.applied = append(f.applied, Log{Index: l.Index, Term: l.Term, Data: append([]byte(nil), l.Data...)})
+	return nil
+}
+
+func (f *recordingFSM) Snapshot() (FSMSnapshot, error) { return &MockSnapshot{}, nil }
+
+func (f *recordingFSM) Restore(rc io.ReadCloser) error {
+	_, _ = io.Copy(io.Discard, rc)
+	return rc.Close()
+}
+
+func (f *recordingFSM) logs() []Log {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]Log(nil), f.applied...)
+}
+
+// waitApplied waits until the FSM has applied the command at index.
+func (f *recordingFSM) waitApplied(t *testing.T, index uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, l := range f.logs() {
+			if l.Index == index {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("FSM did not apply index %d; applied %v", index, f.logs())
+}
+
+// testFollower is a single Raft node "f" whose log is set up by the test,
+// and a transport for a fake leader "l" that sends it hand-built RPCs.
+type testFollower struct {
+	r      *Raft
+	store  *InmemStore
+	fsm    *recordingFSM
+	leader *InmemTransport
+}
+
+// newTestFollower starts node "f" with the given log and current term. The
+// configuration has three voters (f, l, g); timeouts are long so that f stays
+// a follower for the duration of the test.
+func newTestFollower(t *testing.T, term uint64, entries ...*Log) *testFollower {
+	t.Helper()
+	conf := Configuration{Servers: []Server{
+		{Suffrage: Voter, ID: "f", Address: "f"},
+		{Suffrage: Voter, ID: "l", Address: "l"},
+		{Suffrage: Voter, ID: "g", Address: "g"},
+	}}
+	store := NewInmemStore()
+	logs := append([]*Log{{Index: 1, Term: 1, Type: LogConfiguration, Data: EncodeConfiguration(conf)}}, entries...)
+	require.NoError(t, store.StoreLogs(logs))
+	require.NoError(t, store.SetUint64(keyCurrentTerm, term))
+
+	_, fTrans := NewInmemTransport("f")
+	_, lTrans := NewInmemTransport("l")
+	lTrans.Connect("f", fTrans)
+	fTrans.Connect("l", lTrans)
+
+	cfg := inmemConfig(t)
+	cfg.LocalID = "f"
+	cfg.HeartbeatTimeout = 10 * time.Second
+	cfg.ElectionTimeout = 10 * time.Second
+	cfg.LeaderLeaseTimeout = 10 * time.Second
+	fsm := &recordingFSM{}
+	r, err := NewRaft(cfg, fsm, store, store, NewInmemSnapshotStore(), fTrans)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown().Error() })
+	return &testFollower{r: r, store: store, fsm: fsm, leader: lTrans}
+}
+
+func (f *testFollower) header() RPCHeader {
+	return RPCHeader{ProtocolVersion: ProtocolVersionMax, ID: []byte("l"), Addr: f.leader.EncodePeer("l", "l")}
+}
+
+// appendEntries sends req from the fake leader and requires it to succeed.
+func (f *testFollower) appendEntries(t *testing.T, req AppendEntriesRequest) {
+	t.Helper()
+	req.RPCHeader = f.header()
+	var resp AppendEntriesResponse
+	require.NoError(t, f.leader.AppendEntries("f", "f", &req, &resp))
+	require.True(t, resp.Success, "append rejected: %+v", resp)
+}
+
+// requireCommitted checks the follower's commit and applied indexes. Both are
+// set on the main thread before the RPC response is sent, so no wait is needed.
+func (f *testFollower) requireCommitted(t *testing.T, commit, applied uint64) {
+	t.Helper()
+	require.Equal(t, commit, f.r.getCommitIndex(), "commit index")
+	require.Equal(t, applied, f.r.getLastApplied(), "applied index")
+}
+
+func cmd(index, term uint64, data string) *Log {
+	return &Log{Index: index, Term: term, Type: LogCommand, Data: []byte(data)}
+}
+
+// A follower holding a stale, never-committed tail must not commit it when an
+// append whose entries end before the tail carries a higher LeaderCommitIndex.
+// This happens when a new leader builds its first append to a follower (prev =
+// its election-time last index, no entries) but reads its commit index only
+// after its no-op at the next index has committed through other servers.
+func TestRaft_AppendEntries_FollowerDoesNotCommitStaleTail(t *testing.T) {
+	// Index 1-2 are committed in term 1. Index 3 was written by a term-2
+	// leader that was cut off; it never committed.
+	f := newTestFollower(t, 2, cmd(2, 1, "committed"), cmd(3, 2, "stale"))
+
+	// Leader l (term 3, elected with last index 2) committed its own entry 3
+	// through g, then sends: prev 2, no entries, commit 3.
+	f.appendEntries(t, AppendEntriesRequest{Term: 3, PrevLogEntry: 2, PrevLogTerm: 1, LeaderCommitIndex: 3})
+	f.requireCommitted(t, 2, 2)
+	f.fsm.waitApplied(t, 2)
+
+	// The next append carries l's entry 3, which replaces the stale one.
+	f.appendEntries(t, AppendEntriesRequest{Term: 3, PrevLogEntry: 2, PrevLogTerm: 1, LeaderCommitIndex: 3,
+		Entries: []*Log{cmd(3, 3, "leader")}})
+	f.requireCommitted(t, 3, 3)
+	f.fsm.waitApplied(t, 3)
+
+	for _, l := range f.fsm.logs() {
+		require.NotEqual(t, "stale", string(l.Data), "applied a never-committed entry: %+v", l)
+	}
+	applied := f.fsm.logs()
+	require.Len(t, applied, 2)
+	require.Equal(t, uint64(3), applied[1].Term)
+}
+
+// An append whose last covered entry lies below the follower's commit index
+// must not move the commit index, backwards or forwards, nor apply anything.
+func TestRaft_AppendEntries_CoveredEndBelowCommitIndex(t *testing.T) {
+	f := newTestFollower(t, 1, cmd(2, 1, "a"), cmd(3, 1, "b"), cmd(4, 1, "c"), cmd(5, 1, "d"))
+
+	f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 5, PrevLogTerm: 1, LeaderCommitIndex: 4})
+	f.requireCommitted(t, 4, 4)
+
+	// No entries, matching prev 2, LeaderCommitIndex 5: covers up to 2 only.
+	f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 2, PrevLogTerm: 1, LeaderCommitIndex: 5})
+	f.requireCommitted(t, 4, 4)
+
+	// Duplicate entries 2-3 after prev 1, LeaderCommitIndex 5: covers up to 3.
+	f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 1, PrevLogTerm: 1, LeaderCommitIndex: 5,
+		Entries: []*Log{cmd(2, 1, "a"), cmd(3, 1, "b")}})
+	f.requireCommitted(t, 4, 4)
+
+	// An append covering index 5 still advances the commit index.
+	f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 5, PrevLogTerm: 1, LeaderCommitIndex: 5})
+	f.requireCommitted(t, 5, 5)
+	f.fsm.waitApplied(t, 5)
+	require.Len(t, f.fsm.logs(), 4)
+}
+
+// A follower still catches up: entries arrive with a commit index below their
+// end, and the leader's later commit-only append (prev = the follower's last
+// index, no entries) commits the rest.
+func TestRaft_AppendEntries_FollowerCatchesUpOnCommitOnlyAppend(t *testing.T) {
+	f := newTestFollower(t, 1)
+
+	f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 1, PrevLogTerm: 1, LeaderCommitIndex: 2,
+		Entries: []*Log{cmd(2, 1, "a"), cmd(3, 1, "b"), cmd(4, 1, "c")}})
+	f.requireCommitted(t, 2, 2)
+
+	f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 4, PrevLogTerm: 1, LeaderCommitIndex: 4})
+	f.requireCommitted(t, 4, 4)
+	f.fsm.waitApplied(t, 4)
+	require.Len(t, f.fsm.logs(), 3)
+
+	// A commit index beyond the follower's log is capped at the covered end.
+	f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 4, PrevLogTerm: 1, LeaderCommitIndex: 9,
+		Entries: []*Log{cmd(5, 1, "d")}})
+	f.requireCommitted(t, 5, 5)
+}
