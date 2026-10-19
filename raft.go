@@ -1989,7 +1989,6 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 			rpcErr = err
 			return
 		}
-		r.setLastLog(req.LastLogIndex, req.LastLogTerm)
 	}
 
 	// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the
