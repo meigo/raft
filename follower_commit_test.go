@@ -56,7 +56,7 @@ func (f *recordingFSM) waitApplied(t *testing.T, index uint64) {
 // and a transport for a fake leader "l" that sends it hand-built RPCs.
 type testFollower struct {
 	r      *Raft
-	store  *InmemStore
+	store  LogStore
 	fsm    *recordingFSM
 	leader *InmemTransport
 }
@@ -66,15 +66,26 @@ type testFollower struct {
 // a follower for the duration of the test.
 func newTestFollower(t *testing.T, term uint64, entries ...*Log) *testFollower {
 	t.Helper()
-	conf := Configuration{Servers: []Server{
-		{Suffrage: Voter, ID: "f", Address: "f"},
-		{Suffrage: Voter, ID: "l", Address: "l"},
-		{Suffrage: Voter, ID: "g", Address: "g"},
-	}}
-	store := NewInmemStore()
-	logs := append([]*Log{{Index: 1, Term: 1, Type: LogConfiguration, Data: EncodeConfiguration(conf)}}, entries...)
-	require.NoError(t, store.StoreLogs(logs))
-	require.NoError(t, store.SetUint64(keyCurrentTerm, term))
+	logs := append([]*Log{{Index: 1, Term: 1, Type: LogConfiguration, Data: EncodeConfiguration(testFollowerConf)}}, entries...)
+	return newTestFollowerOn(t, NewInmemStore(), term, logs...)
+}
+
+// testFollowerConf is the configuration newTestFollower stores at index 1.
+var testFollowerConf = Configuration{Servers: []Server{
+	{Suffrage: Voter, ID: "f", Address: "f"},
+	{Suffrage: Voter, ID: "l", Address: "l"},
+	{Suffrage: Voter, ID: "g", Address: "g"},
+}}
+
+// newTestFollowerOn starts node "f" on the given log store holding exactly
+// logs, with the given current term.
+func newTestFollowerOn(t *testing.T, store LogStore, term uint64, logs ...*Log) *testFollower {
+	t.Helper()
+	if len(logs) > 0 {
+		require.NoError(t, store.StoreLogs(logs))
+	}
+	stable := NewInmemStore()
+	require.NoError(t, stable.SetUint64(keyCurrentTerm, term))
 
 	_, fTrans := NewInmemTransport("f")
 	_, lTrans := NewInmemTransport("l")
@@ -87,7 +98,7 @@ func newTestFollower(t *testing.T, term uint64, entries ...*Log) *testFollower {
 	cfg.ElectionTimeout = 10 * time.Second
 	cfg.LeaderLeaseTimeout = 10 * time.Second
 	fsm := &recordingFSM{}
-	r, err := NewRaft(cfg, fsm, store, store, NewInmemSnapshotStore(), fTrans)
+	r, err := NewRaft(cfg, fsm, store, stable, NewInmemSnapshotStore(), fTrans)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown().Error() })
 	return &testFollower{r: r, store: store, fsm: fsm, leader: lTrans}
