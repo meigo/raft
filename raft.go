@@ -1585,16 +1585,22 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "storeLogs"}, start)
 	}
 
-	// Update the commit index
+	// Update the commit index. Only the entries this request covers (up to
+	// PrevLogEntry plus the new entries) are known to match the leader's log,
+	// so the commit index is capped there, not at our own last index: a stale
+	// tail beyond it may never have been committed. The commit index never
+	// moves backwards.
 	if a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {
-		start := time.Now()
-		idx := min(a.LeaderCommitIndex, r.getLastIndex())
-		r.setCommitIndex(idx)
-		if r.configurations.latestIndex <= idx {
-			r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
+		idx := min(a.LeaderCommitIndex, a.PrevLogEntry+uint64(len(a.Entries)))
+		if idx > r.getCommitIndex() {
+			start := time.Now()
+			r.setCommitIndex(idx)
+			if r.configurations.latestIndex <= idx {
+				r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
+			}
+			r.processLogs(idx, nil)
+			metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
 		}
-		r.processLogs(idx, nil)
-		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
 	}
 
 	// Everything went well, set success
@@ -1891,6 +1897,16 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 		}
 		reqConfigurationIndex = req.LastLogIndex
 	}
+
+	// Check our logs against the snapshot before changing anything, so that a
+	// log store error fails the install cleanly.
+	keepLogs, err := r.logsMatchSnapshot(req.LastLogIndex, req.LastLogTerm)
+	if err != nil {
+		r.logger.Error("failed to check logs against snapshot", "error", err)
+		rpcErr = err
+		return
+	}
+
 	version := getSnapshotVersion(r.protocolVersion)
 	sink, err := r.snapshots.Create(version, req.LastLogIndex, req.LastLogTerm,
 		reqConfiguration, reqConfigurationIndex, r.trans)
@@ -1959,6 +1975,22 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	// Restore the peer set
 	r.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)
 	r.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)
+
+	// Keep our logs only if they agree with the snapshot (Raft paper, Figure
+	// 13, steps 6 and 7; checked above). Otherwise the entries above our
+	// commit index may be divergent and never committed: compaction would
+	// keep those below the snapshot index (up to TrailingLogs), from where
+	// this server could later replicate them as leader, and one at the
+	// snapshot index would fail every following AppendEntries consistency
+	// check.
+	if !keepLogs {
+		if err := r.discardUncommittedLogs(); err != nil {
+			r.logger.Error("failed to discard uncommitted logs", "error", err)
+			rpcErr = err
+			return
+		}
+		r.setLastLog(req.LastLogIndex, req.LastLogTerm)
+	}
 
 	// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the
 	// logs. In both cases, log any errors and continue.
