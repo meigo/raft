@@ -3,6 +3,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -51,7 +52,9 @@ func TestRaft_InstallSnapshot_DivergentSuffixPastSnapshot(t *testing.T) {
 	// 2. Partition {A, F}. A appends entries that reach only F.
 	c.Partition([]ServerAddress{A.localAddr, F.localAddr})
 	for i := 0; i < 300; i++ {
-		A.Apply([]byte(fmt.Sprintf("STALE-%d", i)), 50*time.Millisecond)
+		// The futures never complete (no majority); the timeout bounds only
+		// the enqueue, so a slow schedule doesn't drop entries.
+		A.Apply([]byte(fmt.Sprintf("STALE-%d", i)), time.Second)
 	}
 	var fLast uint64
 	waitForCondition(t, "F to receive stale entries", 5*time.Second, func() bool {
@@ -79,7 +82,25 @@ func TestRaft_InstallSnapshot_DivergentSuffixPastSnapshot(t *testing.T) {
 		fut = L.Apply([]byte(fmt.Sprintf("new-%d", i)), 5*time.Second)
 	}
 	require.NoError(t, fut.Error())
-	require.NoError(t, L.Snapshot().Error())
+	// Every majority server snapshots and compacts, so whichever of them
+	// leads after the rejoin can't repair F by appends alone: F must
+	// install a snapshot.
+	committed := L.getLastIndex()
+	minSnap := ^uint64(0)
+	for _, r := range c.rafts {
+		if r == A || r == F {
+			continue
+		}
+		waitForCondition(t, "majority server applied the new entries", 5*time.Second, func() bool {
+			return r.AppliedIndex() >= committed
+		})
+		require.NoError(t, r.Snapshot().Error())
+		idx, _ := r.getLastSnapshot()
+		minSnap = min(minSnap, idx)
+		rFirst, err := r.logs.FirstIndex()
+		require.NoError(t, err)
+		require.Greater(t, rFirst, prefix+1, "a majority server kept F's match point")
+	}
 	snapIdx, snapTerm := L.getLastSnapshot()
 	first, err := L.logs.FirstIndex()
 	require.NoError(t, err)
@@ -106,30 +127,59 @@ func TestRaft_InstallSnapshot_DivergentSuffixPastSnapshot(t *testing.T) {
 		return ld != nil && F.AppliedIndex() >= ld.getLastIndex() && F.getLastIndex() == ld.getLastIndex()
 	})
 
-	// 5. F's log matches the leader's at every index both hold. F's store
-	// may have a gap below its snapshot (the committed prefix stays).
+	// 5. F caught up through a snapshot, not by appends alone.
 	ld := c.Leader()
 	fSnap, _ := F.getLastSnapshot()
+	require.GreaterOrEqual(t, fSnap, minSnap, "F didn't install a majority server's snapshot")
+	require.Greater(t, fSnap, prefix, "F's snapshot doesn't cover its conflict point")
+
+	// F's stored log, read from the store itself rather than the cached
+	// indexes: it ends where the leader's does, holds no stale entry at any
+	// index, and matches the leader wherever both hold an entry. Gaps are
+	// allowed (the committed prefix may stay below the snapshot).
 	fFirst, err := F.logs.FirstIndex()
 	require.NoError(t, err)
-	lFirst, err := ld.logs.FirstIndex()
+	fLastRaw, err := F.logs.LastIndex()
 	require.NoError(t, err)
-	require.Equal(t, ld.getLastIndex(), F.getLastIndex())
-	for i := max(max(fFirst, lFirst), fSnap+1); i <= ld.getLastIndex(); i++ {
+	require.Equal(t, ld.getLastIndex(), fLastRaw, "F's store ends elsewhere than the leader's log")
+	for i := fFirst; i <= fLastRaw; i++ {
 		var a, b Log
-		require.NoError(t, F.logs.GetLog(i, &a))
-		require.NoError(t, ld.logs.GetLog(i, &b))
+		if err := F.logs.GetLog(i, &a); errors.Is(err, ErrLogNotFound) {
+			continue
+		} else {
+			require.NoError(t, err)
+		}
+		require.False(t, strings.Contains(string(a.Data), "STALE-"), "F's store keeps a stale entry at index %d", i)
+		if err := ld.logs.GetLog(i, &b); errors.Is(err, ErrLogNotFound) {
+			continue
+		} else {
+			require.NoError(t, err)
+		}
 		require.Equal(t, b.Term, a.Term, "term differs at index %d", i)
 		require.Equal(t, b.Data, a.Data, "data differs at index %d", i)
 	}
 
-	// F's FSM state equals the leader's, and F never applied a stale entry.
-	for _, e := range fFSM.history() {
-		require.False(t, strings.Contains(e, "STALE-"), "F applied a never-committed entry: %s", e)
-	}
+	// F's FSM converges on the leader's (AppliedIndex only means sent to the
+	// FSM), and F never applied a stale entry.
+	var ldFSM *MockFSM
 	for i, r := range c.rafts {
 		if r == ld {
-			require.Equal(t, getMockFSM(c.fsms[i]).Logs(), fFSM.Logs(), "F's FSM differs from the leader's")
+			ldFSM = getMockFSM(c.fsms[i])
 		}
+	}
+	waitForCondition(t, "F's FSM to match the leader's", 10*time.Second, func() bool {
+		a, b := ldFSM.Logs(), fFSM.Logs()
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if string(a[i]) != string(b[i]) {
+				return false
+			}
+		}
+		return true
+	})
+	for _, e := range fFSM.history() {
+		require.False(t, strings.Contains(e, "STALE-"), "F applied a never-committed entry: %s", e)
 	}
 }
