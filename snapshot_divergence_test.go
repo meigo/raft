@@ -121,8 +121,8 @@ func TestRaft_InstallSnapshot_KeepsMatchingLogs(t *testing.T) {
 	// must stay.
 	t.Run("snapshot index already committed", func(t *testing.T) {
 		f := newTestFollower(t, 1, cmd(2, 1, "a"), cmd(3, 1, "b"), cmd(4, 1, "c"), cmd(5, 1, "d"), cmd(6, 1, "e"))
-		f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 6, PrevLogTerm: 1, LeaderCommitIndex: 6})
-		f.requireCommitted(t, 6, 6)
+		f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 4, PrevLogTerm: 1, LeaderCommitIndex: 4})
+		f.requireCommitted(t, 4, 4)
 		require.NoError(t, f.store.DeleteRange(1, 4))
 		f.installSnapshot(t, 1, 4, 1)
 

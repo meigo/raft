@@ -146,8 +146,8 @@ func (f *testFollower) stored(t *testing.T) map[uint64]uint64 {
 }
 
 // After a snapshot install the follower's log store holds what it should, its
-// last log never points past the store's end, and the leader's next append
-// succeeds. On InmemStore the lagging, empty-log and divergent TrailingLogs 0
+// last log is set from the store's end before compaction, and the leader's
+// next append succeeds. On InmemStore the lagging, empty-log and divergent TrailingLogs 0
 // cases hang on the parent commit: recording the snapshot index as the last log made compaction call
 // DeleteRange(0, x) on an empty InmemStore, which wraps its last index to
 // MaxUint64, and the next install's DeleteRange(commit+1, MaxUint64) never
