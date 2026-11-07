@@ -326,6 +326,49 @@ func (r *Raft) discardUncommittedLogs() error {
 	return nil
 }
 
+// dropUnverifiedPrefix removes, at start-up, the log entries at or below the
+// last snapshot's index unless our entry at that index has the snapshot's
+// term, which by Log Matching vouches for every entry before it. An install
+// publishes and restores its snapshot before it discards the entries that
+// conflict with it (installSnapshot), so a crash in between leaves them below
+// the snapshot, from where this server as leader would replicate them to a
+// member behind the snapshot. The snapshot holds every committed entry up to
+// its index, so dropping the prefix loses nothing. Entries above the snapshot
+// stay: they may be committed, and appendEntries resolves a conflict there.
+func (r *Raft) dropUnverifiedPrefix() error {
+	snapIdx, snapTerm := r.getLastSnapshot()
+	if snapIdx == 0 {
+		return nil
+	}
+	first, err := r.logs.FirstIndex()
+	if err != nil {
+		return fmt.Errorf("failed to get first log index: %w", err)
+	}
+	if first == 0 || first > snapIdx {
+		return nil
+	}
+	var entry Log
+	if err := r.logs.GetLog(snapIdx, &entry); err == nil && entry.Term == snapTerm {
+		return nil
+	} else if err != nil && !errors.Is(err, ErrLogNotFound) {
+		return fmt.Errorf("failed to get log %d: %w", snapIdx, err)
+	}
+	last, err := r.logs.LastIndex()
+	if err != nil {
+		return fmt.Errorf("failed to get last log index: %w", err)
+	}
+	to := min(last, snapIdx)
+	r.logger.Warn("dropping log entries at or below the snapshot that may not match it",
+		"from", first, "to", to, "snapshot-index", snapIdx)
+	if err := r.logs.DeleteRange(first, to); err != nil {
+		return fmt.Errorf("failed to delete logs %d to %d: %w", first, to, err)
+	}
+	if last <= snapIdx {
+		r.setLastLog(0, 0)
+	}
+	return nil
+}
+
 // removeOldLogs removes all old logs from the store. This is used for
 // MonotonicLogStores after restore. Callers should verify that the store
 // implementation is monotonic prior to calling.
