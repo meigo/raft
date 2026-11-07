@@ -53,6 +53,24 @@ func TestRaft_AppendEntries_PrevLogAtSnapshotIndexWithSuffix(t *testing.T) {
 	}
 }
 
+// After an install that leaves the log store's last index below the
+// snapshot, there is nothing new to snapshot. The unsigned delta in
+// shouldSnapshot wrapped, so a snapshot was due at every interval.
+func TestRaft_ShouldSnapshot_AfterInstallAboveLog(t *testing.T) {
+	for _, st := range testLogStores {
+		t.Run(st.name, func(t *testing.T) {
+			f := newTestFollowerOn(t, st.new(), 1, confLog(), cmd(2, 1, "a"), cmd(3, 1, "b"))
+			f.setTrailingLogs(t, 2)
+			f.appendEntries(t, AppendEntriesRequest{Term: 1, PrevLogEntry: 3, PrevLogTerm: 1, LeaderCommitIndex: 3})
+			f.installSnapshot(t, 2, 10, 2)
+			last, err := f.store.LastIndex()
+			require.NoError(t, err)
+			require.Less(t, last, uint64(10))
+			require.False(t, f.r.shouldSnapshot(), "a snapshot is due right after an install at 10 with the store's last index at %d", last)
+		})
+	}
+}
+
 // fakeMember answers a leader's RPCs like an empty server that accepts
 // whatever continues its log, and records every entry it is sent.
 type fakeMember struct {

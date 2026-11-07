@@ -115,7 +115,12 @@ func (r *Raft) shouldSnapshot() bool {
 		return false
 	}
 
-	// Compare the delta to the threshold
+	// Compare the delta to the threshold. After an install the store's last
+	// index may be below the snapshot (the entry at its index is never
+	// stored): nothing is new then, and the unsigned delta would wrap.
+	if lastIdx < lastSnap {
+		return false
+	}
 	delta := lastIdx - lastSnap
 	return delta >= r.config().SnapshotThreshold
 }
