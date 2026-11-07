@@ -602,6 +602,10 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	if err := r.restoreSnapshot(); err != nil {
 		return nil, err
 	}
+	if err := r.dropUnverifiedPrefix(); err != nil {
+		return nil, err
+	}
+	lastLog.Index, lastLog.Term = r.getLastLog()
 
 	if err := r.restoreFromCommittedLogs(); err != nil {
 		return nil, err

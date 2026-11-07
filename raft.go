@@ -1493,13 +1493,25 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	// Verify the last log entry
 	if a.PrevLogEntry > 0 {
 		lastIdx, lastTerm := r.getLastEntry()
+		snapIdx, snapTerm := r.getLastSnapshot()
 
 		var prevLogTerm uint64
 		if a.PrevLogEntry == lastIdx {
 			prevLogTerm = lastTerm
 		} else {
 			var prevLog Log
-			if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {
+			switch err := r.logs.GetLog(a.PrevLogEntry, &prevLog); {
+			case err == nil:
+				prevLogTerm = prevLog.Term
+			case errors.Is(err, ErrLogNotFound) && a.PrevLogEntry == snapIdx:
+				// An install never stores the entry at the snapshot index,
+				// and compaction may remove it. The snapshot carries its
+				// term, as setPreviousLog uses on the leader. Without this,
+				// once we hold entries beyond the snapshot, an append right
+				// after it is rejected and the leader sends the same
+				// snapshot again, which keeps those entries.
+				prevLogTerm = snapTerm
+			default:
 				r.logger.Warn("failed to get previous log",
 					"previous-index", a.PrevLogEntry,
 					"last-index", lastIdx,
@@ -1507,7 +1519,6 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 				resp.NoRetryBackoff = true
 				return
 			}
-			prevLogTerm = prevLog.Term
 		}
 
 		if a.PrevLogTerm != prevLogTerm {
